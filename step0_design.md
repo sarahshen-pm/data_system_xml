@@ -128,22 +128,6 @@ After all data is loaded, constraints are applied:
 - `FOREIGN KEY` from `authored.author_id` → `authors(author_id)`
 - `FOREIGN KEY` from `authored.pubid` → `publications(pubid)`
 
-### `4_add_index.sql` — Baseline Indexes
-
-Initial indexes created to support the 8 queries:
-
-| Index | Table & Column | Purpose |
-|---|---|---|
-| `idx_pub_year` | `publications(year)` | Year-range filters (Q1, Q3) |
-| `idx_pub_type` | `publications(pub_type)` | Type filters (Q1, Q3) |
-| `idx_pub_pubkey` | `publications(pubkey)` | Crossref joins (Q2) |
-| `idx_authored_pubid` | `authored(pubid)` | Join from pub → authors |
-| `idx_authored_aid` | `authored(author_id)` | Join from author → pubs |
-| `idx_inproc_booktitle` | `inproceedings(booktitle)` | Venue name search (Q4) |
-| `idx_proc_booktitle` | `proceedings(booktitle)` | Venue name search |
-| `idx_articles_journal` | `articles(journal)` | Journal name search (Q4) |
-| `idx_inproc_crossref` | `inproceedings(crossref)` | Crossref lookup (Q2) |
-
 ---
 
 ## Step 3 — Analytical Queries: `step3_queries/`
@@ -176,29 +160,65 @@ Each query is run **twice** per scale: once **without index**, once **with index
 
 ## Step 4 — Index Optimisation: `step4_index_improvement/index.sql`
 
-After running the baseline queries, the initial indexes were evaluated as insufficient for certain queries (Q2, Q4, Q7a, Q8). The strategy was revised:
+Index design followed an **iterative two-version approach**: a basic single-column strategy was applied first, benchmarked against all 8 queries, then replaced with a more targeted composite and trigram-based strategy where performance was insufficient.
 
-### Revised Index Strategy
+---
 
-| Index | Type | Purpose |
+### Version 1 — Basic Single-Column B-Tree Indexes
+
+The first attempt used straightforward single-column B-Tree indexes on the most frequently filtered columns:
+
+| Index | Table & Column | Targeted Queries |
 |---|---|---|
-| `idx_authored_pubid_author_id` | B-Tree composite | Reverse lookup: pub → authors (avoids sort) |
-| `idx_publications_year_pubid` | B-Tree composite | Year range filter + pubid join in one pass |
-| `idx_publications_pub_type_year` | B-Tree composite | Combined type + year filter (Q3) |
-| `idx_inproceedings_crossref` | B-Tree | Crossref join (Q2) |
-| `idx_authors_lower_name_pattern` | B-Tree `text_pattern_ops` | Case-insensitive prefix search on author name (Q7a) |
-| `idx_publications_title_trgm` | GIN trigram | Substring search on title (Q4, Q5, Q6) |
-| `idx_inproceedings_booktitle_trgm` | GIN trigram | Substring search on booktitle (Q4) |
-| `idx_articles_journal_trgm` | GIN trigram | Substring search on journal name (Q4) |
+| `idx_pub_pubkey` | `publications(pubkey)` | Q2 (crossref join) |
+| `idx_pub_year` | `publications(year)` | Q1, Q3, Q5, Q7 |
+| `idx_pub_type` | `publications(pub_type)` | Q1, Q3, Q8 |
+| `idx_authored_pubid` | `authored(pubid)` | Q4, Q7, Q8 |
+| `idx_authored_aid` | `authored(author_id)` | Q4, Q7, Q8 |
+| `idx_authors_name` | `authors(name)` | Q7a |
+| `idx_inproc_booktitle` | `inproceedings(booktitle)` | Q4, Q5 |
+| `idx_inproc_crossref` | `inproceedings(crossref)` | Q2 |
+| `idx_articles_journal` | `articles(journal)` | Q4, Q5 |
 
-> **Note**: `pg_trgm` extension must be enabled before creating trigram indexes:  
-> `CREATE EXTENSION IF NOT EXISTS pg_trgm;`
+**Limitations identified after benchmarking:**
+- `ILIKE '%keyword%'` queries (Q4, Q5, Q6) could **not** use B-Tree indexes due to the leading wildcard — the planner fell back to sequential scans.
+- Composite filters (e.g. `pub_type = 'inproceedings' AND year BETWEEN ...`) required scanning two separate indexes and merging results via bitmap operations, which was less efficient than a single composite index.
+- Queries starting from `pubid` and fetching `author_id` (reverse of the PK direction) could not benefit from the existing `authored(author_id, pubid)` primary key index.
+- Prefix search on `authors.name ILIKE 'H%'` was not properly accelerated by a plain B-Tree index without `text_pattern_ops`.
 
-### Key Observations
+---
 
-- Standard B-Tree indexes do **not** accelerate `ILIKE '%keyword%'` patterns because the wildcard prefix prevents index use. Trigram (GIN) indexes solve this.
-- `authors(name)` already has a unique index from the constraint in Step 2; a separate functional index on `lower(name)` with `text_pattern_ops` is needed for case-insensitive prefix queries.
-- `authored(author_id, pubid)` already has a PK index in `(author_id, pubid)` order; the reverse `(pubid, author_id)` composite index is needed for queries that start from a pubid and fetch authors.
+### Version 2 — Optimised Composite & Trigram Indexes
+
+Based on the benchmarking results above, all Version 1 indexes were dropped and replaced with a more targeted strategy:
+
+| Index | Type | Rationale |
+|---|---|---|
+| `idx_authored_pubid_author_id` | B-Tree composite `(pubid, author_id)` | Reverse lookup direction needed by Q4, Q7, Q8 — not covered by the existing PK |
+| `idx_publications_year_pubid` | B-Tree composite `(year, pubid)` | Combines year range filter with pubid in a single index scan; eliminates extra lookup step |
+| `idx_publications_pub_type_year` | B-Tree composite `(pub_type, year)` | Enables efficient combined filtering for Q3 (`inproceedings` + decade range) |
+| `idx_inproceedings_crossref` | B-Tree `(crossref)` | Retained from V1; critical for Q2's join between `inproceedings` and `proceedings` via `pubkey` |
+| `idx_authors_lower_name_pattern` | B-Tree `lower(name) text_pattern_ops` | Enables fast prefix matching (`ILIKE 'H%'`) for Q7a; `text_pattern_ops` allows pattern-aware index use |
+| `idx_publications_title_trgm` | GIN trigram | Accelerates `ILIKE '%june%'` on `title` for Q6 — the only index type that handles leading wildcards |
+| `idx_inproceedings_booktitle_trgm` | GIN trigram | Accelerates `ILIKE '%data%'` on `booktitle` for Q4 and Q5 |
+| `idx_articles_journal_trgm` | GIN trigram | Accelerates `ILIKE '%data%'` on `journal` for Q4 and Q5 |
+
+> **Prerequisite**: The `pg_trgm` extension must be enabled before creating trigram indexes:
+> ```sql
+> CREATE EXTENSION IF NOT EXISTS pg_trgm;
+> ```
+
+---
+
+### Key Design Decisions
+
+1. **GIN trigram over B-Tree for `ILIKE '%…%'`**: Standard B-Tree indexes require a fixed prefix to use the index; any leading `%` forces a sequential scan. GIN-based trigram indexes decompose strings into 3-character n-grams and can match any substring pattern efficiently, regardless of position.
+
+2. **Composite indexes instead of multi-index bitmap merges**: When a query filters on both `pub_type` and `year`, PostgreSQL with separate single-column indexes must build two bitmap scans and AND them together. A single composite index `(pub_type, year)` satisfies both predicates in one pass, reducing I/O significantly at large scale.
+
+3. **Functional index with `text_pattern_ops`**: A standard B-Tree index on `name` uses locale-aware comparison, which does not support pattern matching operators (`LIKE`, `ILIKE`). The `text_pattern_ops` operator class instructs the index to use byte-level ordering, enabling `ILIKE 'H%'` to be resolved with an index range scan rather than a full table scan.
+
+4. **Reusing existing unique constraint indexes**: `publications(pubkey)` and `authors(name)` each have a unique constraint from Step 2, which PostgreSQL automatically backs with a B-Tree index. These are **reused** by the query planner and do not need to be recreated explicitly — only the gaps (reverse authored order, composite filters, substring matching) required new indexes in Version 2.
 
 ---
 
